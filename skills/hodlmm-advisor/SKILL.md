@@ -96,13 +96,29 @@ All outputs are JSON to stdout.
 - `elevated` (31–60) — acceptable, widen range
 - `crisis` (61–100) — IL risk dominates, avoid new entries
 
+**Yield signal:** `apr24h` (actual realized 24h fees, annualized). Reflects live trading volume, not just the protocol fee setting. Falls back to 10% of full APR if `apr24h` is unavailable.
+
+**Score formula:** `log-normalized(apr24h) / (1 + binSpread × (1 + reserveImbalanceRatio))` — capped at 100.
+
+**Verdict thresholds (consistent across all commands):**
+- `score ≥ 60` → `enter`
+- `score ≥ 30` → `wait`
+- `score < 30` or `regime === crisis` → `avoid`
+
 **Strategy auto-selection:**
 - `spot` — calm regime, balanced reserves
 - `curve` — skewed reserves (>60% imbalance)
 - `bid-ask` — crisis regime or high volatility
+
+**`entry-plan` verdict — when "Deploy now" is emitted:**
+- Calm regime + APR > 20%
+- Elevated regime + score ≥ 70 + reserve imbalance ≤ 30% + APR > 20%
+
+An agent should only execute liquidity deployment when `plan.verdict === "Deploy now"`.
 
 ## Known constraints
 
 - Bitflow HODLMM APIs are public during beta (no API key needed)
 - All pool data is live; no caching
 - `entry-plan` capital split is based on current pool composition and may shift before execution
+- `skippedPools` in `best-pools` output indicates pools that could not be evaluated (API errors). If non-zero, results may be incomplete — re-run or check individual pools with `pool-summary`

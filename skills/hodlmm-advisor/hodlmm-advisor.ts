@@ -25,6 +25,10 @@ const BITFLOW_APP_API = "https://bff.bitflowapis.finance/api/app/v1";
 const FETCH_TIMEOUT_MS = 30_000;
 const NETWORK = "mainnet";
 
+// Absolute verdict thresholds — consistent across best-pools and pool-summary
+const SCORE_ENTER = 60;
+const SCORE_WAIT = 30;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -156,6 +160,10 @@ function getSymbolFromContract(contract: string): string {
   return name.split("-").slice(0, 2).join("-").toUpperCase();
 }
 
+function isBtcToken(symbol: string): boolean {
+  return ["sBTC", "BTC"].includes(symbol);
+}
+
 function computeRiskMetrics(
   binsData: BinsResponse,
   poolDetail: PoolDetail
@@ -225,12 +233,53 @@ function computeRiskMetrics(
   };
 }
 
-function scorePool(feeBps: number, risk: RiskMetrics): number {
-  if (feeBps === 0) return 0;
-  // Risk-adjusted: higher fee, lower spread, lower imbalance = better score
-  const rawScore =
-    feeBps / (1 + risk.binSpread * (1 + risk.reserveImbalanceRatio));
-  return Math.round(Math.min(rawScore * 2.5, 100));
+/**
+ * Compute a risk-adjusted score (0–100) for a pool.
+ *
+ * Primary yield signal: apr24h (actual realized 24h fees annualized).
+ * This reflects current trading volume, not just the static protocol fee setting.
+ * feeBps is only used as a last-resort fallback when no APR data is available.
+ *
+ * Log-normalization handles the wide range of HODLMM APRs (0–1000%+).
+ * 100% apr24h at zero risk → score ≈ 100.
+ */
+function scorePool(
+  feeBps: number,
+  apr24h: number,
+  risk: RiskMetrics,
+  aprFull?: number
+): number {
+  // Prefer apr24h (what the pool actually earned today).
+  // Fall back to 10% of full APR as a conservative proxy, then feeBps → %.
+  const yieldSignal =
+    apr24h > 0
+      ? apr24h
+      : (aprFull ?? 0) > 0
+        ? aprFull! * 0.1
+        : feeBps / 100;
+
+  if (yieldSignal <= 0) return 0;
+
+  // Risk-adjusted: lower spread and imbalance = more reliable yield capture
+  const riskFactor = 1 + risk.binSpread * (1 + risk.reserveImbalanceRatio);
+
+  // Log-normalize: log1p(100) ≈ 4.615 → maps 100% apr24h at zero risk → ~100
+  const rawScore = (Math.log1p(yieldSignal) / Math.log1p(100)) * 100;
+  return Math.round(Math.min(rawScore / riskFactor, 100));
+}
+
+/**
+ * Assign a verdict using absolute thresholds.
+ * Consistent between best-pools and pool-summary.
+ */
+function assignVerdict(
+  score: number,
+  regime: RiskMetrics["regime"]
+): "enter" | "wait" | "avoid" {
+  if (regime === "crisis") return "avoid";
+  if (score >= SCORE_ENTER) return "enter";
+  if (score >= SCORE_WAIT) return "wait";
+  return "avoid";
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +363,8 @@ async function bestPools(opts: {
   const activePools = allPools.filter((p) => p.active);
 
   const results: ScoredPool[] = [];
+  let skippedPools = 0;
+  const skipReasons: string[] = [];
 
   await Promise.all(
     activePools.map(async (pool) => {
@@ -328,7 +379,7 @@ async function bestPools(opts: {
         const risk = computeRiskMetrics(binsData, detail);
         const feeBps =
           pool.x_total_fee_bps ?? pool.x_protocol_fee + pool.x_provider_fee;
-        const score = scorePool(feeBps, risk);
+        const score = scorePool(feeBps, detail.apr24h, risk, detail.apr);
 
         results.push({
           poolId: pool.pool_id,
@@ -346,34 +397,30 @@ async function bestPools(opts: {
           score,
           verdict: "wait",
         });
-      } catch {
-        // skip pools with API errors silently
+      } catch (e) {
+        skippedPools++;
+        skipReasons.push(
+          `${pool.pool_id}: ${e instanceof Error ? e.message : String(e)}`
+        );
       }
     })
   );
 
   results.sort((a, b) => b.score - a.score);
-  const topThird = Math.ceil(results.length / 3);
-  const bottomIdx = results.length - Math.ceil(results.length / 3);
-  results.forEach((r, i) => {
-    if (r.risk.regime === "crisis") {
-      r.verdict = "avoid";
-    } else if (i < topThird) {
-      r.verdict = "enter";
-    } else if (i >= bottomIdx) {
-      r.verdict = "avoid";
-    } else {
-      r.verdict = "wait";
-    }
+
+  // Assign verdicts using absolute thresholds — consistent with pool-summary
+  results.forEach((r) => {
+    r.verdict = assignVerdict(r.score, r.risk.regime);
   });
 
   const limited = results.slice(0, opts.limit);
 
-  printJson({
+  const output: Record<string, unknown> = {
     status: "success",
     network: NETWORK,
     timestamp: new Date().toISOString(),
     totalPoolsEvaluated: results.length,
+    skippedPools,
     ranked: limited.map((r) => ({
       poolId: r.poolId,
       name: r.name,
@@ -389,7 +436,14 @@ async function bestPools(opts: {
       score: r.score,
       verdict: r.verdict,
     })),
-  } as Record<string, unknown>);
+  };
+
+  if (skippedPools > 0) {
+    output.warning = `${skippedPools} pool(s) skipped due to API errors — results may be incomplete. Re-run or check individual pools with pool-summary.`;
+    output.skipReasons = skipReasons;
+  }
+
+  printJson(output);
 }
 
 // ---------------------------------------------------------------------------
@@ -409,13 +463,8 @@ async function poolSummary(poolId: string): Promise<void> {
   const risk = computeRiskMetrics(binsData, detail);
   const feeBps =
     pool.x_total_fee_bps ?? pool.x_protocol_fee + pool.x_provider_fee;
-  const score = scorePool(feeBps, risk);
-
-  let verdict: "enter" | "wait" | "avoid";
-  if (risk.regime === "crisis") verdict = "avoid";
-  else if (score >= 60) verdict = "enter";
-  else if (score >= 30) verdict = "wait";
-  else verdict = "avoid";
+  const score = scorePool(feeBps, detail.apr24h, risk, detail.apr);
+  const verdict = assignVerdict(score, risk.regime);
 
   printJson({
     status: "success",
@@ -468,6 +517,12 @@ async function entryPlan(opts: {
   if (!pool) throw new Error(`Pool ${opts.poolId} not found`);
 
   const risk = computeRiskMetrics(binsData, detail);
+  const feeBps =
+    pool.x_total_fee_bps ?? pool.x_protocol_fee + pool.x_provider_fee;
+  const score = scorePool(feeBps, detail.apr24h, risk, detail.apr);
+
+  const tokenXSymbol = getSymbolFromContract(pool.token_x);
+  const tokenYSymbol = getSymbolFromContract(pool.token_y);
 
   // Strategy auto-selection
   let strategy: string;
@@ -482,7 +537,8 @@ async function entryPlan(opts: {
   }
 
   // Bin range width scales with volatility
-  const halfRange = risk.regime === "calm" ? 2 : risk.regime === "elevated" ? 4 : 8;
+  const halfRange =
+    risk.regime === "calm" ? 2 : risk.regime === "elevated" ? 4 : 8;
   const binRange = {
     from: risk.activeBinId - halfRange,
     to: risk.activeBinId + halfRange,
@@ -504,17 +560,35 @@ async function entryPlan(opts: {
   const xPct = detail.poolComposition.tokenX.percentage / 100;
   const yPct = detail.poolComposition.tokenY.percentage / 100;
 
+  // Unit labels: "sats" for BTC/sBTC tokens, "est. input units" for everything else
+  const xUnit = isBtcToken(tokenXSymbol) ? "sats" : "est. input units";
+  const yUnit = isBtcToken(tokenYSymbol) ? "sats" : "est. input units";
+
+  // "Deploy now" is reachable for:
+  //   - calm regime + APR > 20% (standard)
+  //   - elevated regime + strong score (≥70) + balanced reserves (imbalance ≤ 0.3) + APR > 20%
+  //     (elevated-regime entry is possible under good conditions — use narrower range)
+  const canDeploy =
+    risk.regime === "calm" ||
+    (risk.regime === "elevated" &&
+      score >= 70 &&
+      risk.reserveImbalanceRatio <= 0.3);
+
   let verdict: string;
   let reasoning: string;
   if (risk.regime === "crisis") {
     verdict = "High IL risk — wait for regime to calm";
-    reasoning = `Volatility score ${risk.volatilityScore} (crisis). Pool is ${detail.poolComposition.tokenX.percentage.toFixed(0)}% ${getSymbolFromContract(pool.token_x)} / ${detail.poolComposition.tokenY.percentage.toFixed(0)}% ${getSymbolFromContract(pool.token_y)} — heavily imbalanced. LP losses from IL likely exceed fee income.`;
+    reasoning = `Volatility score ${risk.volatilityScore} (crisis). Pool is ${detail.poolComposition.tokenX.percentage.toFixed(0)}% ${tokenXSymbol} / ${detail.poolComposition.tokenY.percentage.toFixed(0)}% ${tokenYSymbol} — heavily imbalanced. LP losses from IL likely exceed fee income.`;
   } else if (ilWarning) {
     verdict = "Deploy with caution — price near range edge";
     reasoning = `Active bin at ${(risk.activePositionPct * 100).toFixed(0)}% of the liquidity range. Consider narrowing range to stay in-range longer.`;
-  } else if (risk.regime === "calm" && detail.apr > 20) {
+  } else if (canDeploy && detail.apr > 20) {
     verdict = "Deploy now";
-    reasoning = `Calm regime, APR ${detail.apr.toFixed(1)}%, balanced reserves. Good entry conditions.`;
+    if (risk.regime === "elevated") {
+      reasoning = `Elevated regime but strong metrics: score ${score}, APR ${detail.apr.toFixed(1)}%, reserves balanced (imbalance ${(risk.reserveImbalanceRatio * 100).toFixed(0)}%). Deploy with narrower range (halfWidth: ${Math.max(halfRange - 2, 1)}).`;
+    } else {
+      reasoning = `Calm regime, APR ${detail.apr.toFixed(1)}%, balanced reserves. Good entry conditions.`;
+    }
   } else {
     verdict = "Wait for better entry";
     reasoning = `Regime is ${risk.regime} with APR ${detail.apr.toFixed(1)}%. Monitor for improved conditions before deploying.`;
@@ -525,8 +599,8 @@ async function entryPlan(opts: {
     network: NETWORK,
     timestamp: new Date().toISOString(),
     poolId: opts.poolId,
-    tokenX: getSymbolFromContract(pool.token_x),
-    tokenY: getSymbolFromContract(pool.token_y),
+    tokenX: tokenXSymbol,
+    tokenY: tokenYSymbol,
     amountSats: opts.amountSats,
     plan: {
       strategy,
@@ -535,14 +609,15 @@ async function entryPlan(opts: {
       aprFull: `${detail.apr.toFixed(2)}%`,
       apr24h: `${detail.apr24h.toFixed(2)}%`,
       suggestedSplit: {
-        tokenX: `${(xPct * 100).toFixed(0)}% (~${Math.round(opts.amountSats * xPct)} sats equivalent)`,
-        tokenY: `${(yPct * 100).toFixed(0)}% (~${Math.round(opts.amountSats * yPct)} sats equivalent)`,
+        tokenX: `${(xPct * 100).toFixed(0)}% (~${Math.round(opts.amountSats * xPct)} ${xUnit})`,
+        tokenY: `${(yPct * 100).toFixed(0)}% (~${Math.round(opts.amountSats * yPct)} ${yUnit})`,
       },
       ilWarning,
       verdict,
       reasoning,
     },
     riskMetrics: {
+      score,
       volatilityScore: risk.volatilityScore,
       regime: risk.regime,
       binSpread: risk.binSpread,
@@ -563,7 +638,7 @@ program
   .description(
     "HODLMM LP advisor — ranks pools by risk-adjusted score, generates entry plans, and summarizes pool health. Read-only, no wallet required."
   )
-  .version("1.0.0");
+  .version("1.1.0");
 
 program
   .command("doctor")
@@ -608,7 +683,9 @@ program
 
 program
   .command("entry-plan")
-  .description("Generate bin range, strategy, and entry recommendation for a pool")
+  .description(
+    "Generate bin range, strategy, and entry recommendation for a pool"
+  )
   .requiredOption("--pool-id <id>", "Pool identifier (e.g. dlmm_3)")
   .requiredOption(
     "--amount-sats <n>",
@@ -617,7 +694,11 @@ program
   )
   .option("--strategy <type>", "Override strategy: spot | curve | bid-ask")
   .action(
-    async (opts: { poolId: string; amountSats: number; strategy?: string }) => {
+    async (opts: {
+      poolId: string;
+      amountSats: number;
+      strategy?: string;
+    }) => {
       try {
         await entryPlan(opts);
       } catch (e) {

@@ -11,7 +11,7 @@ description: "Advisory agent that ranks Bitflow HODLMM pools by risk-adjusted yi
 1. Run `doctor` first. If any check fails, stop and surface the API connectivity issue.
 2. Run `best-pools --limit 5 --min-liquidity 10000` to identify candidate pools.
 3. For each pool with `verdict: enter`, run `entry-plan` to get deployment specifics.
-4. Only proceed to `bitflow add-liquidity-simple` if `plan.verdict` is exactly `"Deploy now"`.
+4. Only proceed to `bitflow add-liquidity-simple` if `plan.verdict` is exactly `"Deploy now"`. This is reachable for calm-regime pools and for elevated-regime pools with strong score (≥70), low imbalance (≤30%), and APR > 20%.
 5. For open positions, run `pool-summary` every 4–12 hours to monitor regime changes.
 
 ## Guardrails
