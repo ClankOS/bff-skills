@@ -11,7 +11,7 @@
  *   bun run skills/hodlmm-advisor/hodlmm-advisor.ts doctor
  *   bun run skills/hodlmm-advisor/hodlmm-advisor.ts best-pools [--limit 5] [--min-liquidity 10000]
  *   bun run skills/hodlmm-advisor/hodlmm-advisor.ts pool-summary --pool-id dlmm_3
- *   bun run skills/hodlmm-advisor/hodlmm-advisor.ts entry-plan --pool-id dlmm_3 --amount-sats 100000
+ *   bun run skills/hodlmm-advisor/hodlmm-advisor.ts entry-plan --pool-id dlmm_3 --amount 100000
  */
 
 import { Command } from "commander";
@@ -504,7 +504,7 @@ async function poolSummary(poolId: string): Promise<void> {
 
 async function entryPlan(opts: {
   poolId: string;
-  amountSats: number;
+  amount: number;
   strategy?: string;
 }): Promise<void> {
   const [pools, detail, binsData] = await Promise.all([
@@ -582,16 +582,16 @@ async function entryPlan(opts: {
   } else if (ilWarning) {
     verdict = "Deploy with caution — price near range edge";
     reasoning = `Active bin at ${(risk.activePositionPct * 100).toFixed(0)}% of the liquidity range. Consider narrowing range to stay in-range longer.`;
-  } else if (canDeploy && detail.apr > 20) {
+  } else if (canDeploy && detail.apr24h > 20) {
     verdict = "Deploy now";
     if (risk.regime === "elevated") {
-      reasoning = `Elevated regime but strong metrics: score ${score}, APR ${detail.apr.toFixed(1)}%, reserves balanced (imbalance ${(risk.reserveImbalanceRatio * 100).toFixed(0)}%). Deploy with narrower range (halfWidth: ${Math.max(halfRange - 2, 1)}).`;
+      reasoning = `Elevated regime but strong metrics: score ${score}, APR ${detail.apr24h.toFixed(1)}%, reserves balanced (imbalance ${(risk.reserveImbalanceRatio * 100).toFixed(0)}%). Deploy with narrower range (halfWidth: ${Math.max(halfRange - 2, 1)}).`;
     } else {
-      reasoning = `Calm regime, APR ${detail.apr.toFixed(1)}%, balanced reserves. Good entry conditions.`;
+      reasoning = `Calm regime, APR ${detail.apr24h.toFixed(1)}%, balanced reserves. Good entry conditions.`;
     }
   } else {
     verdict = "Wait for better entry";
-    reasoning = `Regime is ${risk.regime} with APR ${detail.apr.toFixed(1)}%. Monitor for improved conditions before deploying.`;
+    reasoning = `Regime is ${risk.regime} with APR ${detail.apr24h.toFixed(1)}%. Monitor for improved conditions before deploying.`;
   }
 
   printJson({
@@ -601,7 +601,7 @@ async function entryPlan(opts: {
     poolId: opts.poolId,
     tokenX: tokenXSymbol,
     tokenY: tokenYSymbol,
-    amountSats: opts.amountSats,
+    amount: opts.amount,
     plan: {
       strategy,
       binRange,
@@ -609,8 +609,8 @@ async function entryPlan(opts: {
       aprFull: `${detail.apr.toFixed(2)}%`,
       apr24h: `${detail.apr24h.toFixed(2)}%`,
       suggestedSplit: {
-        tokenX: `${(xPct * 100).toFixed(0)}% (~${Math.round(opts.amountSats * xPct)} ${xUnit})`,
-        tokenY: `${(yPct * 100).toFixed(0)}% (~${Math.round(opts.amountSats * yPct)} ${yUnit})`,
+        tokenX: `${(xPct * 100).toFixed(0)}% (~${Math.round(opts.amount * xPct)} ${xUnit})`,
+        tokenY: `${(yPct * 100).toFixed(0)}% (~${Math.round(opts.amount * yPct)} ${yUnit})`,
       },
       ilWarning,
       verdict,
@@ -688,15 +688,15 @@ program
   )
   .requiredOption("--pool-id <id>", "Pool identifier (e.g. dlmm_3)")
   .requiredOption(
-    "--amount-sats <n>",
-    "Capital to deploy in sats",
+    "--amount <n>",
+    "Capital to deploy (sats for BTC pools, base units otherwise)",
     (v) => parseInt(v, 10)
   )
   .option("--strategy <type>", "Override strategy: spot | curve | bid-ask")
   .action(
     async (opts: {
       poolId: string;
-      amountSats: number;
+      amount: number;
       strategy?: string;
     }) => {
       try {

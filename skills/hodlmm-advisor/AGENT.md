@@ -38,13 +38,13 @@ description: "Advisory agent that ranks Bitflow HODLMM pools by risk-adjusted yi
 
 | Regime change | Action |
 |---|---|
-| calm → elevated | Widen bin range; run `hodlmm-risk assess-pool` for secondary confirmation |
+| calm → elevated | Widen bin range; run `pool-summary` more frequently for closer monitoring |
 | elevated → crisis | Exit position via `bitflow withdraw-liquidity-simple` |
 | `reserveImbalanceRatio > 0.8` | Position likely out of range — consider exit |
 | `activePositionPct < 0.15` or `> 0.85` | Price drifting away from range — monitor closely |
 
 ## Integration with other skills
 
-- Use `hodlmm-risk assess-pool` for secondary risk confirmation when regime is `elevated`
+- When regime is `elevated`, increase `pool-summary` frequency to every 2-4 hours
 - Use `bitflow add-liquidity-simple` to execute after `verdict: "Deploy now"`
 - Use `bitflow withdraw-liquidity-simple` to exit when `pool-summary` shows crisis

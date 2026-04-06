@@ -65,12 +65,12 @@ bun run skills/hodlmm-advisor/hodlmm-advisor.ts pool-summary --pool-id dlmm_3
 Full LP entry plan for a pool: strategy, bin range, capital split, IL warning, plain-English verdict.
 
 ```bash
-bun run skills/hodlmm-advisor/hodlmm-advisor.ts entry-plan --pool-id dlmm_3 --amount-sats 100000
+bun run skills/hodlmm-advisor/hodlmm-advisor.ts entry-plan --pool-id dlmm_3 --amount 100000
 ```
 
 Options:
 - `--pool-id` (required)
-- `--amount-sats` (required) — capital in sats
+- `--amount` (required) — capital to deploy (sats for BTC pools, base units otherwise)
 - `--strategy` (optional) — override auto-selection: `spot` | `curve` | `bid-ask`
 
 ## Output contract
