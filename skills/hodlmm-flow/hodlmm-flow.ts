@@ -14,6 +14,8 @@
  */
 
 import { Command } from "commander";
+import { mkdirSync, readFileSync, writeFileSync, existsSync } from "fs";
+import { join } from "path";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -29,6 +31,8 @@ const DEFAULT_SWAP_COUNT = 100;
 const TX_PAGE_SIZE = 50;
 const DLMM_CORE = "SP1PFR4V08H1RAZXREBGFFQ59WB739XM8VVGTFSEA.dlmm-core-v-1-1";
 const LIQUIDATOR_PREFIX = "SP16B5ZKHJAK4CSHQ1WYSZE57NWMKW0KDX6YZKH4J.liquidator";
+const CACHE_DIR = join(process.env.HOME ?? "/tmp", ".hodlmm-flow-cache");
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 const POOL_CONTRACTS: Record<string, string> = {
   dlmm_1: "SM1FKXGNZJWSTWDWXQZJNF7B5TV5ZB235JTCXYXKD.dlmm-pool-sbtc-usdcx-v-1-bps-10",
@@ -156,6 +160,41 @@ function handleError(error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
   printJson({ error: message });
   process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// Cache
+// ---------------------------------------------------------------------------
+
+function cacheKey(poolId: string, swapCount: number, windowSeconds?: number): string {
+  return `${poolId}_${swapCount}_${windowSeconds ?? "all"}`;
+}
+
+function cachePath(key: string): string {
+  return join(CACHE_DIR, `${key}.json`);
+}
+
+function readCache(key: string): FlowAnalysis | null {
+  const path = cachePath(key);
+  if (!existsSync(path)) return null;
+  try {
+    const raw = readFileSync(path, "utf-8");
+    const cached = JSON.parse(raw) as FlowAnalysis & { _cachedAt: number };
+    if (Date.now() - cached._cachedAt > CACHE_TTL_MS) return null;
+    delete (cached as unknown as Record<string, unknown>)._cachedAt;
+    return cached;
+  } catch {
+    return null;
+  }
+}
+
+function writeCache(key: string, data: FlowAnalysis): void {
+  try {
+    mkdirSync(CACHE_DIR, { recursive: true });
+    writeFileSync(cachePath(key), JSON.stringify({ ...data, _cachedAt: Date.now() }));
+  } catch {
+    // Cache write failure is non-fatal
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -822,10 +861,18 @@ function parseDuration(input: string): number {
 async function analyzePool(
   poolId: string,
   swapCount: number,
-  windowSeconds?: number
+  windowSeconds?: number,
+  skipCache = false
 ): Promise<FlowAnalysis> {
   const contract = POOL_CONTRACTS[poolId];
   if (!contract) throw new Error(`Unknown pool: ${poolId}. Valid: ${Object.keys(POOL_CONTRACTS).join(", ")}`);
+
+  // Check cache (5-min TTL — avoids redundant Hiro crawls for repeated calls)
+  const key = cacheKey(poolId, swapCount, windowSeconds);
+  if (!skipCache) {
+    const cached = readCache(key);
+    if (cached) return cached;
+  }
 
   const poolInfo = await getPoolInfo(poolId);
 
@@ -886,7 +933,7 @@ async function analyzePool(
     label: a.label,
   }));
 
-  return {
+  const result: FlowAnalysis = {
     status: "success",
     network: "mainnet",
     timestamp: new Date().toISOString(),
@@ -898,6 +945,9 @@ async function analyzePool(
     verdict,
     topActors,
   };
+
+  writeCache(key, result);
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -994,9 +1044,11 @@ program
   .option("--swaps <count>", "Number of swaps to analyze", String(DEFAULT_SWAP_COUNT))
   .option("--all", "Analyze all primary pools")
   .option("--hiro-api-key <key>", "Hiro API key for elevated rate limits")
+  .option("--no-cache", "Bypass cache and force fresh analysis")
   .action(async (opts) => {
     try {
       if (opts.hiroApiKey) hiroApiKey = opts.hiroApiKey;
+      const skipCache = opts.cache === false;
 
       const swapCount = parseInt(opts.swaps, 10) || DEFAULT_SWAP_COUNT;
       const windowSeconds = opts.window ? parseDuration(opts.window) : undefined;
@@ -1008,7 +1060,7 @@ program
 
         for (const poolId of PRIMARY_POOLS) {
           try {
-            const analysis = await analyzePool(poolId, swapCount, windowSeconds);
+            const analysis = await analyzePool(poolId, swapCount, windowSeconds, skipCache);
             results.push(analysis);
           } catch (e) {
             errors.push({
@@ -1055,7 +1107,7 @@ program
           process.exit(1);
         }
 
-        const analysis = await analyzePool(poolId, swapCount, windowSeconds);
+        const analysis = await analyzePool(poolId, swapCount, windowSeconds, skipCache);
         printJson(analysis);
       }
     } catch (e) {
