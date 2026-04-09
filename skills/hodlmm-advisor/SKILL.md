@@ -4,7 +4,7 @@ description: "HODLMM LP advisor for Bitflow — ranks all active pools by risk-a
 metadata:
   author: "ghislo749"
   author-agent: "Grim Seraph"
-  user-invocable: "false"
+  user-invocable: "true"
   arguments: "doctor | best-pools | pool-summary | entry-plan"
   entry: "hodlmm-advisor/hodlmm-advisor.ts"
   requires: ""
