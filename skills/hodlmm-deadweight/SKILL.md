@@ -2,10 +2,10 @@
 name: hodlmm-deadweight
 description: "Capital efficiency X-ray for HODLMM — scans all pools to show how much liquidity is earning fees vs stranded out of range, protocol-wide or per-address with on-chain position reads."
 metadata:
-  author: "ghislo749"
+  author: "ClankOS"
   author-agent: "Grim Seraph"
   user-invocable: "false"
-  arguments: "doctor | scan"
+  arguments: "doctor | install-packs | scan"
   entry: "hodlmm-deadweight/hodlmm-deadweight.ts"
   requires: ""
   tags: "l2, defi, read-only, mainnet-only"
@@ -44,6 +44,13 @@ Checks connectivity to Bitflow APIs (quotes, app, bins) and Hiro Stacks API. Ver
 bun run skills/hodlmm-deadweight/hodlmm-deadweight.ts doctor
 ```
 
+### install-packs
+No-op subcommand for registry compatibility. This skill has no additional packs to install.
+
+```bash
+bun run skills/hodlmm-deadweight/hodlmm-deadweight.ts install-packs
+```
+
 ### scan
 Protocol-wide capital efficiency scan across all active HODLMM pools.
 
@@ -62,6 +69,7 @@ Options:
 - `--address <stx-address>` — STX address to scan
 - `--pool-id <id>` — narrow to a single pool (recommended on free-tier Hiro to avoid rate limits)
 - `--hiro-api-key <key>` — Hiro API key for elevated rate limits
+- `--radius-override <n>` — override the active-bin radius heuristic (advanced; lets you sanity-check the model with a wider or narrower band)
 
 ```bash
 bun run skills/hodlmm-deadweight/hodlmm-deadweight.ts scan --address SP2V3J... --pool-id dlmm_3
@@ -98,6 +106,8 @@ activeRadius = max(5, round(50 / bin_step))
 | 15 | 5 | Floor at 5 |
 
 Bins outside this radius have zero probability of receiving swap volume at the current price level and are classified as deadweight.
+
+This is a heuristic — it approximates "in range" as a fixed band around the active bin, independent of realized volatility. For a belt-and-braces check pass `--radius-override <n>` to scan with a custom band (e.g. `--radius-override 20` to count anything within ±20 bins as earning).
 
 ## Positions indexer (reference implementation)
 

@@ -324,9 +324,10 @@ async function batchedCalls<T>(
 function computePoolEfficiency(
   pool: PoolListItem,
   detail: PoolDetail,
-  bins: BinsResponse
+  bins: BinsResponse,
+  radiusOverride?: number
 ): PoolEfficiency {
-  const radius = activeRadius(pool.bin_step);
+  const radius = radiusOverride !== undefined ? radiusOverride : activeRadius(pool.bin_step);
   const activeBin = bins.active_bin_id;
   const priceX = detail.tokens.tokenX.priceUsd;
   const priceY = detail.tokens.tokenY.priceUsd;
@@ -389,13 +390,14 @@ async function scanUserPool(
   pool: PoolListItem,
   detail: PoolDetail,
   bins: BinsResponse,
-  address: string
+  address: string,
+  radiusOverride?: number
 ): Promise<UserPoolPosition | null> {
   const poolContract = pool.pool_token;
   const userBinIds = await getUserBins(poolContract, address);
   if (userBinIds.length === 0) return null;
 
-  const radius = activeRadius(pool.bin_step);
+  const radius = radiusOverride !== undefined ? radiusOverride : activeRadius(pool.bin_step);
   const activeBin = bins.active_bin_id;
   const priceX = detail.tokens.tokenX.priceUsd;
   const priceY = detail.tokens.tokenY.priceUsd;
@@ -600,6 +602,7 @@ async function scan(opts: {
   address?: string;
   poolId?: string;
   hiroApiKey?: string;
+  radiusOverride?: number;
 }): Promise<void> {
   if (opts.hiroApiKey) hiroApiKey = opts.hiroApiKey;
 
@@ -614,13 +617,13 @@ async function scan(opts: {
   }
 
   if (opts.address) {
-    await scanAddress(pools, opts.address);
+    await scanAddress(pools, opts.address, opts.radiusOverride);
   } else {
-    await scanProtocol(pools);
+    await scanProtocol(pools, opts.radiusOverride);
   }
 }
 
-async function scanProtocol(pools: PoolListItem[]): Promise<void> {
+async function scanProtocol(pools: PoolListItem[], radiusOverride?: number): Promise<void> {
   const results: PoolEfficiency[] = [];
   const skipped: string[] = [];
 
@@ -630,7 +633,7 @@ async function scanProtocol(pools: PoolListItem[]): Promise<void> {
         getPoolDetail(pool.pool_id),
         getPoolBins(pool.pool_id),
       ]);
-      results.push(computePoolEfficiency(pool, detail, bins));
+      results.push(computePoolEfficiency(pool, detail, bins, radiusOverride));
     } catch (e) {
       skipped.push(
         `${pool.pool_id}: ${e instanceof Error ? e.message : String(e)}`
@@ -664,7 +667,8 @@ async function scanProtocol(pools: PoolListItem[]): Promise<void> {
 
 async function scanAddress(
   pools: PoolListItem[],
-  address: string
+  address: string,
+  radiusOverride?: number
 ): Promise<void> {
   const positions: UserPoolPosition[] = [];
   const skipped: string[] = [];
@@ -675,7 +679,7 @@ async function scanAddress(
         getPoolDetail(pool.pool_id),
         getPoolBins(pool.pool_id),
       ]);
-      const pos = await scanUserPool(pool, detail, bins, address);
+      const pos = await scanUserPool(pool, detail, bins, address, radiusOverride);
       if (pos) positions.push(pos);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -760,18 +764,52 @@ program
   )
   .option("--pool-id <id>", "Narrow scan to a single pool (e.g. dlmm_3)")
   .option("--hiro-api-key <key>", "Hiro API key for elevated rate limits")
+  .option(
+    "--radius-override <n>",
+    "Override the active-bin radius heuristic (advanced — for sanity-checking the active-range model with a wider or narrower band)"
+  )
   .action(
     async (opts: {
       address?: string;
       poolId?: string;
       hiroApiKey?: string;
+      radiusOverride?: string;
     }) => {
       try {
-        await scan(opts);
+        const parsed: {
+          address?: string;
+          poolId?: string;
+          hiroApiKey?: string;
+          radiusOverride?: number;
+        } = {
+          address: opts.address,
+          poolId: opts.poolId,
+          hiroApiKey: opts.hiroApiKey,
+        };
+        if (opts.radiusOverride !== undefined) {
+          const n = parseInt(opts.radiusOverride, 10);
+          if (!Number.isFinite(n) || n < 0) {
+            printJson({ error: "--radius-override must be a non-negative integer" });
+            process.exit(1);
+          }
+          parsed.radiusOverride = n;
+        }
+        await scan(parsed);
       } catch (e) {
         handleError(e);
       }
     }
   );
+
+program
+  .command("install-packs")
+  .description("No-op: registry compatibility. This skill has no additional packs to install.")
+  .action(() => {
+    printJson({
+      status: "success",
+      result: "No packs to install — hodlmm-deadweight has no external dependencies beyond bun + node_modules.",
+      packs: [],
+    });
+  });
 
 program.parse(process.argv);
