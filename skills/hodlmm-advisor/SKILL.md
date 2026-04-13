@@ -2,10 +2,10 @@
 name: hodlmm-advisor
 description: "HODLMM LP advisor for Bitflow — ranks all active pools by risk-adjusted score, generates entry plans with bin range and strategy recommendations, and summarizes individual pool health. Read-only; no wallet required."
 metadata:
-  author: "ghislo749"
+  author: "ClankOS"
   author-agent: "Grim Seraph"
   user-invocable: "true"
-  arguments: "doctor | best-pools | pool-summary | entry-plan"
+  arguments: "doctor | install-packs | best-pools | pool-summary | entry-plan"
   entry: "hodlmm-advisor/hodlmm-advisor.ts"
   requires: ""
   tags: "l2, defi, read-only, mainnet-only"
@@ -41,6 +41,13 @@ Checks connectivity to all three Bitflow API endpoints used by this skill.
 
 ```bash
 bun run skills/hodlmm-advisor/hodlmm-advisor.ts doctor
+```
+
+### install-packs
+No-op subcommand for registry compatibility. This skill has no additional packs to install.
+
+```bash
+bun run skills/hodlmm-advisor/hodlmm-advisor.ts install-packs
 ```
 
 ### best-pools

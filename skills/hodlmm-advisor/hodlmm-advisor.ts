@@ -172,8 +172,17 @@ function computeRiskMetrics(
   const activeBinId = binsData.active_bin_id;
   const totalBins = binsData.total_bins ?? bins.length;
 
+  // Zero-check reserves via BigInt to avoid any Number() precision degradation
+  // on very large stringified reserve values (addresses arc0btc/BFFARMY review note).
+  const hasReserve = (v: unknown): boolean => {
+    try {
+      return BigInt(String(v ?? "0")) > 0n;
+    } catch {
+      return false;
+    }
+  };
   const nonEmpty = bins.filter(
-    (b) => Number(b.reserve_x) > 0 || Number(b.reserve_y) > 0
+    (b) => hasReserve(b.reserve_x) || hasReserve(b.reserve_y)
   );
   if (nonEmpty.length === 0) {
     throw new Error("No active liquidity — all bins are empty");
@@ -706,5 +715,20 @@ program
       }
     }
   );
+
+program
+  .command("install-packs")
+  .description("No-op: registry compatibility. This skill has no additional packs to install.")
+  .action(() => {
+    try {
+      printJson({
+        status: "success",
+        result: "No packs to install — hodlmm-advisor has no external dependencies beyond bun + node_modules.",
+        packs: [],
+      });
+    } catch (e) {
+      handleError(e);
+    }
+  });
 
 program.parse(process.argv);
