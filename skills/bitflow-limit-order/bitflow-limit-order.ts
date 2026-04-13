@@ -25,8 +25,12 @@ const EXPLORER_BASE = "https://explorer.hiro.so/txid";
 
 const ORDERS_DIR = path.join(os.homedir(), ".aibtc", "limit-orders");
 const ORDERS_FILE = path.join(ORDERS_DIR, "orders.json");
+const EVENTS_FILE = path.join(ORDERS_DIR, "events.jsonl");
 const WALLETS_DIR = path.join(os.homedir(), ".aibtc", "wallets");
 const WALLETS_FILE = path.join(os.homedir(), ".aibtc", "wallets.json");
+
+// Hiro fungible-token key for sBTC (confirmed live against /extended/v1/address/{addr}/balances)
+const SBTC_HIRO_KEY = "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token::sbtc-token";
 
 // Safety limits (hardcoded floors — NOT configurable)
 const MAX_ORDER_STX = 2000;
@@ -38,6 +42,15 @@ const DEFAULT_EXPIRY_HOURS = 24;
 const MAX_EXPIRY_DAYS = 7;
 const API_TIMEOUT_MS = 10_000;
 const TX_FEE_ESTIMATE = 5000; // microSTX
+const STX_FEE_RESERVE = TX_FEE_ESTIMATE / 1e6; // STX needed for tx fee regardless of side
+
+// Watch-mode + anti-wick
+const DEFAULT_CONFIRM_TICKS = 2;
+const MIN_INTERVAL_MS = 1_000;
+const MAX_INTERVAL_MS = 3_600_000;
+
+// Event log rotation
+const EVENTS_MAX_BYTES = 10 * 1024 * 1024; // 10 MB
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -266,6 +279,47 @@ async function getStxBalance(address: string): Promise<number> {
   return Number(BigInt(data.balance) - BigInt(data.locked)) / 1e6;
 }
 
+async function getSbtcBalance(address: string): Promise<number> {
+  const res = await fetch(`${STACKS_API}/extended/v1/address/${address}/balances`, {
+    signal: AbortSignal.timeout(API_TIMEOUT_MS),
+  });
+  if (!res.ok) throw new Error(`Balance API ${res.status}`);
+  const data = await res.json() as any;
+  const tok = data?.fungible_tokens?.[SBTC_HIRO_KEY];
+  if (!tok || tok.balance === undefined) return 0;
+  return Number(BigInt(tok.balance)) / 1e8; // sBTC has 8 decimals
+}
+
+// ─── Event log (JSONL audit trail) ───────────────────────────────────────────
+
+function appendEvent(event: Record<string, any>): void {
+  try {
+    ensureDir();
+    const line = JSON.stringify({ ts: new Date().toISOString(), ...event }) + "\n";
+    if (fs.existsSync(EVENTS_FILE)) {
+      const sz = fs.statSync(EVENTS_FILE).size;
+      if (sz + Buffer.byteLength(line) > EVENTS_MAX_BYTES) {
+        const rotated = EVENTS_FILE + ".1";
+        if (fs.existsSync(rotated)) fs.unlinkSync(rotated);
+        fs.renameSync(EVENTS_FILE, rotated);
+      }
+    }
+    fs.appendFileSync(EVENTS_FILE, line);
+  } catch (e: any) {
+    log(`Event log write failed: ${e.message}`);
+  }
+}
+
+function readEvents(orderId?: number): any[] {
+  if (!fs.existsSync(EVENTS_FILE)) return [];
+  const raw = fs.readFileSync(EVENTS_FILE, "utf-8").trim();
+  if (!raw) return [];
+  const events = raw.split("\n").map(l => {
+    try { return JSON.parse(l); } catch { return null; }
+  }).filter(Boolean) as any[];
+  return orderId === undefined ? events : events.filter(e => e.orderId === orderId);
+}
+
 // ─── BitflowSDK helpers ──────────────────────────────────────────────────────
 
 function createBitflowSDK(): any {
@@ -385,6 +439,16 @@ function parseDuration(s: string): number {
   const maxMs = MAX_EXPIRY_DAYS * 86_400_000;
   if (ms > maxMs) throw new Error(`Max expiry is ${MAX_EXPIRY_DAYS}d`);
   if (ms < 60_000) throw new Error("Min expiry is 1m");
+  return ms;
+}
+
+function parseInterval(s: string): number {
+  const m = s.match(/^(\d+)(s|m|h)$/);
+  if (!m) throw new Error(`Invalid interval: ${s}. Use format like 5s, 30s, 1m, 5m`);
+  const n = parseInt(m[1]);
+  const ms = m[2] === "s" ? n * 1000 : m[2] === "m" ? n * 60_000 : n * 3_600_000;
+  if (ms < MIN_INTERVAL_MS) throw new Error("Min watch interval is 1s");
+  if (ms > MAX_INTERVAL_MS) throw new Error("Max watch interval is 1h");
   return ms;
 }
 
@@ -614,10 +678,23 @@ program
 
 program
   .command("list")
-  .description("Show all orders with status")
+  .description("Show all orders with status, or read the event-log audit trail")
   .option("--status <status>", "Filter by status (active, filled, cancelled, expired, error)")
+  .option("--events", "Read the JSONL event-log audit trail instead of orders")
+  .option("--order-id <n>", "Filter events to a specific order ID (use with --events)", (v: string) => parseInt(v, 10))
   .action(async (opts) => {
     try {
+      // Event-log read mode
+      if (opts.events) {
+        const events = readEvents(opts.orderId);
+        return success("list-events", {
+          source: EVENTS_FILE,
+          orderIdFilter: opts.orderId ?? null,
+          count: events.length,
+          events,
+        });
+      }
+
       const book = loadOrderBook();
       let orders = book.orders;
 
@@ -688,173 +765,298 @@ program
     }
   });
 
-// ── run ───────────────────────────────────────────────────────────────────────
+// ── run / runCycle ────────────────────────────────────────────────────────────
 
-program
-  .command("run")
-  .description("Check active orders against pool prices, execute triggers")
-  .option("--confirm", "Execute swaps on-chain (without this flag, dry-run only)")
-  .option("--wallet-password <pw>", "Wallet password for keystore decryption (or set AIBTC_WALLET_PASSWORD)")
-  .action(async (opts) => {
+interface CycleStats {
+  checked: number;
+  triggered: number;
+  skipped: number;
+  expired: number;
+  errors: number;
+  closest: { orderId: number; distance: string } | null;
+}
+
+interface CycleCtx {
+  walletPassword: string;
+  dryRun: boolean;
+  useTicks: boolean;        // anti-wick gating active (watch mode only)
+  confirmTicks: number;
+  tickCounts: Map<number, number>;
+  walletCache: { stxPrivateKey: string; stxAddress: string } | null;
+  emitPerOrderJson: boolean; // true = one-shot; watch mode emits per-cycle summary instead
+}
+
+function recordSkip(book: OrderBook, order: LimitOrder, reason: string): void {
+  log(`  → ${reason} — skipping cycle for order #${order.orderId}`);
+  order.lastSkipReason = reason;
+  order.lastSkipAt = new Date().toISOString();
+  saveOrderBook(book);
+  appendEvent({ orderId: order.orderId, event: "skipped", reason });
+}
+
+async function runCycle(ctx: CycleCtx): Promise<CycleStats> {
+  const book = loadOrderBook();
+  const now = new Date();
+
+  // Phase 1: expire
+  let expired = 0;
+  for (const o of book.orders) {
+    if (o.status === "active" && new Date(o.expiresAt) <= now) {
+      o.status = "expired";
+      expired++;
+      appendEvent({ orderId: o.orderId, event: "expired" });
+    }
+  }
+  if (expired > 0) {
+    saveOrderBook(book);
+    log(`Expired ${expired} order(s)`);
+  }
+
+  const active = book.orders.filter(o => o.status === "active");
+  const stats: CycleStats = {
+    checked: active.length, triggered: 0, skipped: 0, expired,
+    errors: 0, closest: null,
+  };
+  if (active.length === 0) return stats;
+
+  let walletFailedThisCycle = false;
+  let closestDist = Infinity;
+
+  for (const order of active) {
     try {
-      const book = loadOrderBook();
-      const now = new Date();
-      const dryRun = !opts.confirm;
+      log(`Checking #${order.orderId}: ${order.pair} ${order.side} @ ${order.targetPrice}`);
+      const { price: currentPrice } = await getActiveBinPrice(order.poolId);
+      const distPct = Math.abs(currentPrice - order.targetPrice) / order.targetPrice * 100;
 
-      // Phase 1: Expire old orders
-      let expiredCount = 0;
-      for (const order of book.orders) {
-        if (order.status === "active" && new Date(order.expiresAt) <= now) {
-          order.status = "expired";
-          expiredCount++;
+      if (distPct < closestDist) {
+        closestDist = distPct;
+        stats.closest = { orderId: order.orderId, distance: `${distPct.toFixed(2)}%` };
+      }
+
+      const shouldTrigger =
+        (order.side === "buy" && currentPrice <= order.targetPrice) ||
+        (order.side === "sell" && currentPrice >= order.targetPrice);
+
+      if (!shouldTrigger) {
+        if (ctx.useTicks && ctx.tickCounts.has(order.orderId)) {
+          ctx.tickCounts.delete(order.orderId);
+          log(`  → #${order.orderId} no longer triggering, anti-wick counter reset`);
         }
-      }
-      if (expiredCount > 0) {
-        saveOrderBook(book);
-        log(`Expired ${expiredCount} order(s)`);
+        log(`  → Not triggered. Current: ${currentPrice}, Target: ${order.targetPrice}, Distance: ${distPct.toFixed(2)}%`);
+        continue;
       }
 
-      // Phase 2: Check active orders
-      const active = book.orders.filter(o => o.status === "active");
-      if (active.length === 0) {
-        return success("check", { checked: 0, triggered: 0, expired: expiredCount, message: "No active orders" });
-      }
-
-      let triggered = 0;
-      let skipped = 0;
-      let closestOrder: { orderId: number; distance: string } | null = null;
-      let closestDist = Infinity;
-
-      // Process orders one at a time (sequential, no race conditions)
-      for (const order of active) {
-        try {
-          log(`Checking order #${order.orderId}: ${order.pair} ${order.side} @ ${order.targetPrice}`);
-
-          const { price: currentPrice } = await getActiveBinPrice(order.poolId);
-
-          // Calculate distance to target
-          const priceDiff = Math.abs(currentPrice - order.targetPrice);
-          const distPct = (priceDiff / order.targetPrice) * 100;
-
-          if (distPct < closestDist) {
-            closestDist = distPct;
-            closestOrder = { orderId: order.orderId, distance: `${distPct.toFixed(2)}%` };
-          }
-
-          // Check trigger condition
-          const shouldTrigger =
-            (order.side === "buy" && currentPrice <= order.targetPrice) ||
-            (order.side === "sell" && currentPrice >= order.targetPrice);
-
-          if (!shouldTrigger) {
-            log(`  → Not triggered. Current: ${currentPrice}, Target: ${order.targetPrice}, Distance: ${distPct.toFixed(2)}%`);
-            continue;
-          }
-
-          log(`  → TRIGGERED! Current: ${currentPrice}, Target: ${order.targetPrice}`);
-
-          // Get wallet
-          let stxPrivateKey: string;
-          let senderAddress: string;
-          try {
-            const pwd = opts.walletPassword ?? process.env.AIBTC_WALLET_PASSWORD ?? "";
-            const wallet = await getWalletKeys(pwd);
-            stxPrivateKey = wallet.stxPrivateKey;
-            senderAddress = wallet.stxAddress;
-          } catch (e: any) {
-            order.status = "error";
-            order.errorMessage = `Wallet error: ${e.message}`;
-            saveOrderBook(book);
-            log(`  → Wallet error: ${e.message}`);
-            continue;
-          }
-
-          // Balance check — skip this cycle if insufficient (order stays active for next run)
-          try {
-            if (isStxToken(order.tokenIn)) {
-              const balance = await getStxBalance(senderAddress);
-              const needed = order.amount + (TX_FEE_ESTIMATE / 1e6);
-              if (balance < needed) {
-                const reason = `Insufficient balance: ${balance.toFixed(4)} STX, need ${needed.toFixed(4)} STX`;
-                log(`  → ${reason} — skipping`);
-                order.lastSkipReason = reason;
-                order.lastSkipAt = new Date().toISOString();
-                saveOrderBook(book);
-                skipped++;
-                continue;
-              }
-            }
-          } catch (e: any) {
-            log(`  → Balance check failed: ${e.message}, proceeding anyway`);
-          }
-
-          // Execute swap
-          try {
-            // Resolve symbols from pair (e.g., "STX-sBTC" → "STX", "sBTC")
-            const pairParts = order.pair.split("-");
-            const tokenInSymbol = order.side === "sell" ? pairParts[0] : pairParts[1];
-            const tokenOutSymbol = order.side === "sell" ? pairParts[1] : pairParts[0];
-
-            const result = await executeSwap({
-              tokenInSymbol,
-              tokenOutSymbol,
-              amountHuman: order.amount,
-              senderAddress,
-              stxPrivateKey,
-              slippagePct: order.slippage,
-              dryRun,
-            });
-
-            order.status = "filled";
-            delete order.lastSkipReason;
-            delete order.lastSkipAt;
-            order.fillData = {
-              txId: result.txId,
-              fillPrice: currentPrice,
-              filledAt: new Date().toISOString(),
-              explorerUrl: result.explorerUrl,
-            };
-            saveOrderBook(book);
-            triggered++;
-
-            success("execute", {
-              orderId: order.orderId,
-              pair: order.pair,
-              side: order.side,
-              fillPrice: currentPrice,
-              targetPrice: order.targetPrice,
-              amount: order.amount,
-              txId: result.txId,
-              explorerUrl: result.explorerUrl,
-              dryRun,
-            });
-
-            // Only execute ONE order per cycle
-            break;
-          } catch (e: any) {
-            order.status = "error";
-            order.errorMessage = `Swap failed: ${e.message}`;
-            saveOrderBook(book);
-            fail("execute", `Order #${order.orderId} swap failed: ${e.message}`);
-            continue;
-          }
-        } catch (e: any) {
-          log(`  → Error checking order #${order.orderId}: ${e.message}`);
+      // Anti-wick gate (watch mode only)
+      if (ctx.useTicks) {
+        const next = (ctx.tickCounts.get(order.orderId) ?? 0) + 1;
+        ctx.tickCounts.set(order.orderId, next);
+        if (next < ctx.confirmTicks) {
+          log(`  → #${order.orderId} pending anti-wick tick ${next}/${ctx.confirmTicks} (current ${currentPrice}, target ${order.targetPrice})`);
+          appendEvent({
+            orderId: order.orderId, event: "pending_trigger",
+            tick: next, of: ctx.confirmTicks, current: currentPrice, target: order.targetPrice,
+          });
           continue;
         }
       }
 
-      // If no trigger happened, emit summary
-      if (triggered === 0) {
-        success("check", {
-          checked: active.length,
-          triggered: 0,
-          skipped,
-          expired: expiredCount,
-          closest: closestOrder,
-          dryRun,
-        });
+      log(`  → TRIGGERED #${order.orderId}: current ${currentPrice}, target ${order.targetPrice}`);
+      appendEvent({ orderId: order.orderId, event: "triggered", current: currentPrice, target: order.targetPrice });
+
+      // Wallet (lazy, cached for the rest of the process)
+      if (!ctx.walletCache && !walletFailedThisCycle) {
+        try {
+          ctx.walletCache = await getWalletKeys(ctx.walletPassword);
+          log(`Wallet resolved: ${ctx.walletCache.stxAddress}`);
+        } catch (e: any) {
+          walletFailedThisCycle = true;
+          const reason = `Wallet unavailable: ${e.message}`;
+          recordSkip(book, order, reason);
+          appendEvent({ orderId: order.orderId, event: "error", stage: "wallet", detail: e.message });
+          stats.skipped++;
+          if (ctx.useTicks) ctx.tickCounts.delete(order.orderId);
+          break; // no point checking more orders this cycle
+        }
       }
+      if (walletFailedThisCycle || !ctx.walletCache) break;
+      const wallet = ctx.walletCache;
+
+      // Balance checks — skip cycle on insufficient funds OR check failure
+      try {
+        if (isStxToken(order.tokenIn)) {
+          const bal = await getStxBalance(wallet.stxAddress);
+          const needed = order.amount + STX_FEE_RESERVE;
+          if (bal < needed) {
+            recordSkip(book, order, `Insufficient STX: have ${bal.toFixed(6)}, need ${needed.toFixed(6)}`);
+            stats.skipped++; if (ctx.useTicks) ctx.tickCounts.delete(order.orderId);
+            continue;
+          }
+        } else if (isSbtcToken(order.tokenIn)) {
+          const sbtc = await getSbtcBalance(wallet.stxAddress);
+          if (sbtc < order.amount) {
+            recordSkip(book, order, `Insufficient sBTC: have ${sbtc.toFixed(8)}, need ${order.amount.toFixed(8)}`);
+            stats.skipped++; if (ctx.useTicks) ctx.tickCounts.delete(order.orderId);
+            continue;
+          }
+          // sBTC swap still needs STX for tx fee
+          const stx = await getStxBalance(wallet.stxAddress);
+          if (stx < STX_FEE_RESERVE) {
+            recordSkip(book, order, `Insufficient STX for tx fee: have ${stx.toFixed(6)}, need ${STX_FEE_RESERVE.toFixed(6)}`);
+            stats.skipped++; if (ctx.useTicks) ctx.tickCounts.delete(order.orderId);
+            continue;
+          }
+        }
+      } catch (e: any) {
+        recordSkip(book, order, `Balance check failed: ${e.message}`);
+        stats.skipped++; if (ctx.useTicks) ctx.tickCounts.delete(order.orderId);
+        continue;
+      }
+
+      // Execute
+      try {
+        const parts = order.pair.split("-");
+        const tokenInSymbol = order.side === "sell" ? parts[0] : parts[1];
+        const tokenOutSymbol = order.side === "sell" ? parts[1] : parts[0];
+
+        const result = await executeSwap({
+          tokenInSymbol, tokenOutSymbol,
+          amountHuman: order.amount,
+          senderAddress: wallet.stxAddress,
+          stxPrivateKey: wallet.stxPrivateKey,
+          slippagePct: order.slippage,
+          dryRun: ctx.dryRun,
+        });
+
+        order.status = "filled";
+        delete order.lastSkipReason;
+        delete order.lastSkipAt;
+        order.fillData = {
+          txId: result.txId,
+          fillPrice: currentPrice,
+          filledAt: new Date().toISOString(),
+          explorerUrl: result.explorerUrl,
+        };
+        saveOrderBook(book);
+        if (ctx.useTicks) ctx.tickCounts.delete(order.orderId);
+        appendEvent({
+          orderId: order.orderId, event: "filled",
+          txid: result.txId, amount: order.amount,
+          fillPrice: currentPrice, target: order.targetPrice, dryRun: ctx.dryRun,
+        });
+        stats.triggered++;
+
+        if (ctx.emitPerOrderJson) {
+          success("execute", {
+            orderId: order.orderId, pair: order.pair, side: order.side,
+            fillPrice: currentPrice, targetPrice: order.targetPrice,
+            amount: order.amount, txId: result.txId,
+            explorerUrl: result.explorerUrl, dryRun: ctx.dryRun,
+          });
+        }
+        break; // one fill per cycle
+      } catch (e: any) {
+        order.status = "error";
+        order.errorMessage = `Swap failed: ${e.message}`;
+        saveOrderBook(book);
+        appendEvent({ orderId: order.orderId, event: "error", stage: "swap", detail: e.message });
+        stats.errors++;
+        if (ctx.emitPerOrderJson) {
+          fail("execute", `Order #${order.orderId} swap failed: ${e.message}`);
+        }
+        continue;
+      }
+    } catch (e: any) {
+      log(`  → Error checking #${order.orderId}: ${e.message}`);
+      appendEvent({ orderId: order.orderId, event: "error", stage: "check", detail: e.message });
+      stats.errors++;
+      continue;
+    }
+  }
+
+  return stats;
+}
+
+program
+  .command("run")
+  .description("Check active orders against pool prices, execute triggers (one-shot or --watch loop)")
+  .option("--confirm", "Execute swaps on-chain (without this flag, dry-run only)")
+  .option("--watch <interval>", "Run as in-process heartbeat loop (e.g., 5s, 30s, 1m, 5m). Without this flag, runs once and exits.")
+  .option("--confirm-ticks <n>", `Anti-wick: require N consecutive triggering cycles before firing (default ${DEFAULT_CONFIRM_TICKS}, watch-mode only)`, (v) => parseInt(v, 10), DEFAULT_CONFIRM_TICKS)
+  .option("--wallet-password <pw>", "Wallet password for keystore decryption (or set AIBTC_WALLET_PASSWORD)")
+  .action(async (opts) => {
+    try {
+      const dryRun = !opts.confirm;
+      const watchMs = opts.watch ? parseInterval(opts.watch) : null;
+      const useTicks = watchMs !== null;
+      const confirmTicks = Math.max(1, Number(opts.confirmTicks) || DEFAULT_CONFIRM_TICKS);
+
+      const ctx: CycleCtx = {
+        walletPassword: opts.walletPassword ?? process.env.AIBTC_WALLET_PASSWORD ?? "",
+        dryRun, useTicks, confirmTicks,
+        tickCounts: new Map(),
+        walletCache: null,
+        emitPerOrderJson: !watchMs,
+      };
+
+      // ── One-shot ──
+      if (!watchMs) {
+        const stats = await runCycle(ctx);
+        if (stats.triggered === 0) {
+          success("check", { ...stats, dryRun });
+        }
+        return;
+      }
+
+      // ── Watch loop ──
+      const startedAt = new Date().toISOString();
+      let cycles = 0, totalFilled = 0, totalSkipped = 0, totalErrors = 0;
+      let stopping = false;
+
+      const printSummary = (action: string) => {
+        output("success", action, {
+          startedAt, endedAt: new Date().toISOString(),
+          cycles, filled: totalFilled, skipped: totalSkipped, errors: totalErrors,
+          dryRun, intervalMs: watchMs, confirmTicks,
+        });
+      };
+
+      const onSig = (sig: string) => {
+        if (stopping) return;
+        stopping = true;
+        log(`${sig} received, stopping watch after current cycle`);
+      };
+      process.on("SIGINT", () => onSig("SIGINT"));
+      process.on("SIGTERM", () => onSig("SIGTERM"));
+
+      log(`Watch mode: every ${opts.watch} (${watchMs}ms), confirm-ticks=${confirmTicks}, dryRun=${dryRun}`);
+      appendEvent({ event: "watch_started", intervalMs: watchMs, confirmTicks, dryRun });
+
+      while (!stopping) {
+        cycles++;
+        const cycleStartedAt = new Date().toISOString();
+        try {
+          const stats = await runCycle(ctx);
+          totalFilled += stats.triggered;
+          totalSkipped += stats.skipped;
+          totalErrors += stats.errors;
+          output("success", "watch-cycle", {
+            cycle: cycles, cycleStartedAt, ...stats, dryRun,
+          });
+        } catch (e: any) {
+          totalErrors++;
+          output("error", "watch-cycle", { cycle: cycles, cycleStartedAt }, e.message);
+        }
+        if (stopping) break;
+        // Sleep in short chunks so SIGINT exits promptly
+        const sleepUntil = Date.now() + watchMs;
+        while (!stopping && Date.now() < sleepUntil) {
+          await new Promise(r => setTimeout(r, Math.min(250, sleepUntil - Date.now())));
+        }
+      }
+
+      appendEvent({ event: "watch_stopped", cycles, filled: totalFilled, errors: totalErrors });
+      printSummary("watch-summary");
+      process.exit(0);
     } catch (e: any) {
       fail("run", e.message);
     }

@@ -3,9 +3,9 @@ name: bitflow-limit-order
 description: "Agent-powered limit orders on Bitflow — set price targets, auto-execute swaps when conditions are met."
 metadata:
   author: "ClankOS"
-  author-agent: "Clank"
+  author-agent: "Grim Seraph"
   user-invocable: "false"
-  arguments: "doctor | set --pair <P> --side <S> --price <N> --amount <N> [--slippage <PCT>] [--expires <DURATION>] | list | cancel <ID> | run [--confirm] [--wallet-password <PW>] | install-packs"
+  arguments: "doctor | set --pair <P> --side <S> --price <N> --amount <N> [--slippage <PCT>] [--expires <DURATION>] | list [--status <S>] [--events] [--order-id <N>] | cancel <ID> | run [--confirm] [--watch <INTERVAL>] [--confirm-ticks <N>] [--wallet-password <PW>] | install-packs"
   entry: "bitflow-limit-order/bitflow-limit-order.ts"
   requires: "wallet, signing, settings"
   tags: "defi, write, mainnet-only, requires-funds, l2"
@@ -73,12 +73,20 @@ bun run bitflow-limit-order/bitflow-limit-order.ts set \
 
 ### `list`
 
-Show all orders with their current status.
+Show all orders with their current status, or read the JSONL event-log audit trail.
 
 ```bash
 bun run bitflow-limit-order/bitflow-limit-order.ts list
 bun run bitflow-limit-order/bitflow-limit-order.ts list --status active
+bun run bitflow-limit-order/bitflow-limit-order.ts list --events
+bun run bitflow-limit-order/bitflow-limit-order.ts list --events --order-id 3
 ```
+
+| Flag | Description |
+|------|-------------|
+| `--status <s>` | Filter orders by status |
+| `--events` | Read `~/.aibtc/limit-orders/events.jsonl` instead of orders |
+| `--order-id <n>` | With `--events`, restrict to one order |
 
 ### `cancel <ID>`
 
@@ -90,14 +98,28 @@ bun run bitflow-limit-order/bitflow-limit-order.ts cancel 3
 
 ### `run`
 
-Check all active orders against live pool prices. Execute any that trigger. Called by agent heartbeat every 5 minutes.
+Check all active orders against live pool prices. Execute any that trigger. Defaults to one-shot (single cycle, exits) — pass `--watch <interval>` to run as an in-process heartbeat loop.
 
 ```bash
+# One-shot (called by external scheduler)
 bun run bitflow-limit-order/bitflow-limit-order.ts run --confirm --wallet-password <PW>
+
+# In-process loop, every 30s, with 2-tick anti-wick filter
+bun run bitflow-limit-order/bitflow-limit-order.ts run --confirm --watch 30s --confirm-ticks 2
 ```
 
-- **`--confirm` required** to execute swaps on-chain. Without it, dry-run only.
-- **`--wallet-password`** for keystore decryption (or set `AIBTC_WALLET_PASSWORD` env var, or `STACKS_PRIVATE_KEY`).
+| Flag | Description |
+|------|-------------|
+| `--confirm` | Execute swaps on-chain. Without it, dry-run only. |
+| `--watch <interval>` | Run in-process heartbeat loop (`5s`, `30s`, `1m`, `5m`, max `1h`). Without it, runs once and exits. |
+| `--confirm-ticks <n>` | Anti-wick guard: require N consecutive triggering cycles before firing. Default `2`. Watch mode only. |
+| `--wallet-password <pw>` | Keystore password (or set `AIBTC_WALLET_PASSWORD`, or use `STACKS_PRIVATE_KEY`). |
+
+**Watch-mode output:** newline-delimited JSON. Each cycle emits one `watch-cycle` JSON line. SIGINT/SIGTERM trigger a final `watch-summary` line before exit. Each line is independently a valid JSON object.
+
+**Anti-wick rationale:** thin L2 liquidity can briefly spike for a single block. Requiring `N` consecutive cycles where `currentPrice` crosses `targetPrice` before firing prevents getting wicked at 3am. The tick counter is in-memory, per-process — it resets on restart and on the first cycle the order stops triggering. Only active under `--watch` (one-shot has no history to check).
+
+**Event log:** every meaningful action (`triggered`, `pending_trigger`, `skipped`, `filled`, `expired`, `error`) appends one JSON line to `~/.aibtc/limit-orders/events.jsonl`. File rotates to `events.jsonl.1` at 10 MB. Read back with `list --events`.
 
 ### `install-packs`
 
@@ -142,7 +164,9 @@ All output is JSON to stdout. Logs go to stderr.
 | Confirmation | `--confirm` required for writes | Always enforced |
 
 **Refusal conditions:**
-- Insufficient wallet balance → order skipped this cycle, stays active for retry
+- Insufficient wallet balance (STX or sBTC, including STX-for-fee on sBTC orders) → order skipped this cycle with `lastSkipReason`, stays active for retry
+- Balance API failure → order skipped this cycle (never proceeds with unknown balance)
+- Wallet decryption failure → cycle aborts, no further orders processed this cycle
 - Slippage exceeds threshold → swap aborted
 - Pool inactive or not found → order rejected at `set` time
 - Nonce out of sequence → broadcast fails safely
