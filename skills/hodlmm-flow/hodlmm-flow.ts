@@ -45,8 +45,8 @@ const POOL_CONTRACTS: Record<string, string> = {
   dlmm_8: "SM1FKXGNZJWSTWDWXQZJNF7B5TV5ZB235JTCXYXKD.dlmm-pool-usdh-usdcx-v-1-bps-1",
 };
 
-// Primary analysis pools (highest volume)
-const PRIMARY_POOLS = ["dlmm_1", "dlmm_3", "dlmm_6", "dlmm_7"];
+// All HODLMM pools (used for --all protocol-wide summary)
+const PRIMARY_POOLS = ["dlmm_1", "dlmm_2", "dlmm_3", "dlmm_4", "dlmm_5", "dlmm_6", "dlmm_7", "dlmm_8"];
 
 // Swap function names on the router contracts
 const SWAP_FUNCTIONS = [
@@ -717,7 +717,7 @@ function generateVerdict(
   score -= biasPenalty;
 
   // Toxicity penalty: high toxicity = informed flow hurting LPs
-  const toxicityPenalty = Math.max(0, (metrics.flowToxicity - 0.5) * 60);
+  const toxicityPenalty = metrics.flowToxicity * 30;
   score -= toxicityPenalty;
 
   // Bin velocity penalty: high velocity = narrow ranges get destroyed
@@ -735,8 +735,11 @@ function generateVerdict(
     : -metrics.liquidationPressure * 5; // slight bonus
   score -= liqPenalty;
 
-  // Bot penalty: bot-dominated flow means retail LPs get adversely selected
-  const botPenalty = Math.max(0, (metrics.botFlowRatio - 0.5) * 20);
+  // Bot penalty: bot-dominated flow is only harmful when toxic.
+  // Mean-reverting arb bots in low-toxicity pools are LP-friendly; informed bots in high-toxicity pools amplify adverse selection.
+  // Scale the base penalty by (0.5 + toxicity): half weight at toxicity=0, 1.5x at toxicity=1.
+  const botPenaltyBase = Math.max(0, (metrics.botFlowRatio - 0.5) * 20);
+  const botPenalty = botPenaltyBase * (0.5 + metrics.flowToxicity);
   score -= botPenalty;
 
   score = Math.max(0, Math.min(100, Math.round(score)));
@@ -1113,6 +1116,17 @@ program
     } catch (e) {
       handleError(e);
     }
+  });
+
+program
+  .command("install-packs")
+  .description("No-op: registry compatibility. This skill has no additional packs to install.")
+  .action(() => {
+    printJson({
+      status: "success",
+      result: "No packs to install — hodlmm-flow has no external dependencies beyond bun + node_modules.",
+      packs: [],
+    });
   });
 
 program.parse();

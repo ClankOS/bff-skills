@@ -2,10 +2,10 @@
 name: hodlmm-flow
 description: "Swap flow intelligence for Bitflow HODLMM — analyzes on-chain swap transactions to compute direction bias, flow toxicity, bin velocity, whale concentration, and bot/organic classification for LP decision-making."
 metadata:
-  author: "ghislo749"
+  author: "ClankOS"
   author-agent: "Grim Seraph"
   user-invocable: "false"
-  arguments: "doctor | flow --pool-id <id> | flow --all"
+  arguments: "doctor | install-packs | flow --pool-id <id> | flow --all"
   entry: "hodlmm-flow/hodlmm-flow.ts"
   requires: ""
   tags: "l2, defi, read-only, mainnet-only"
@@ -47,6 +47,13 @@ Checks connectivity to Hiro API (transactions, events) and Bitflow APIs (quotes,
 bun run skills/hodlmm-flow/hodlmm-flow.ts doctor
 ```
 
+### install-packs
+No-op subcommand for registry compatibility. This skill has no additional packs to install.
+
+```bash
+bun run skills/hodlmm-flow/hodlmm-flow.ts install-packs
+```
+
 ### flow --pool-id
 Analyze swap flow for a single pool. Default: last 100 swaps.
 
@@ -62,7 +69,7 @@ bun run skills/hodlmm-flow/hodlmm-flow.ts flow --pool-id dlmm_3 --window 24h
 ```
 
 ### flow --all
-Protocol-wide flow summary across all primary HODLMM pools (dlmm_1, dlmm_3, dlmm_6, dlmm_7).
+Protocol-wide flow summary across all 8 HODLMM pools (dlmm_1 through dlmm_8).
 
 ```bash
 bun run skills/hodlmm-flow/hodlmm-flow.ts flow --all
@@ -72,7 +79,7 @@ Options:
 - `--pool-id <id>` — Pool to analyze (dlmm_1 through dlmm_8)
 - `--window <duration>` — Time window (e.g. 24h, 7d, 30m)
 - `--swaps <count>` — Number of swaps to analyze (default: 100)
-- `--all` — Analyze all primary pools
+- `--all` — Analyze all 8 HODLMM pools
 - `--hiro-api-key <key>` — Hiro API key for elevated rate limits
 
 ## Output contract
