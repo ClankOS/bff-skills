@@ -745,14 +745,18 @@ function buildWithdrawPayload(params: {
   binIdAbsolute: number;
   amount: bigint;
   feeRateUstx: number;
+  // After an x_for_y swap the LP's Y was consumed → fee captured in X.
+  // After a y_for_x swap the LP's X was consumed → fee captured in Y.
+  // Core requires min-x-amount + min-y-amount > 0 (err u1002 otherwise).
+  swapDirection: "x_for_y" | "y_for_x";
 }): McpCallContract {
   const binOffset = params.binIdAbsolute - DEFAULTS.CENTER_BIN_ID;
   const positions = [
     {
       bin_id: binOffset,
       amount: params.amount.toString(),
-      min_x_amount: "0",
-      min_y_amount: "0",
+      min_x_amount: params.swapDirection === "x_for_y" ? "1" : "0",
+      min_y_amount: params.swapDirection === "y_for_x" ? "1" : "0",
     },
   ];
   return {
@@ -1542,6 +1546,7 @@ async function cmdArm(opts: {
     binIdAbsolute: activeBin.binId,
     amount: 0n,
     feeRateUstx: DEFAULTS.WITHDRAW_GAS_USTX,
+    swapDirection: swap.direction,
   });
   (mcpWithdraw.params as any).positions[0].amount = "FROM_CHAIN";
 
