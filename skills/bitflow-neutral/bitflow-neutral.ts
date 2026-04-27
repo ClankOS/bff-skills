@@ -310,10 +310,10 @@ async function fetchUserLp(poolId: string, wallet: string): Promise<UserBin[]> {
     );
     const bins = (raw.bins ?? []) as Record<string, unknown>[];
     return bins
-      .filter((b) => BigInt(String(b.user_liquidity ?? b.liquidity ?? "0")) > 0n)
+      .filter((b) => BigInt(String(b.userLiquidity ?? b.user_liquidity ?? b.liquidity ?? "0")) > 0n)
       .map((b) => ({
         bin_id: Number(b.bin_id),
-        liquidity: BigInt(String(b.user_liquidity ?? b.liquidity ?? "0")),
+        liquidity: BigInt(String(b.userLiquidity ?? b.user_liquidity ?? b.liquidity ?? "0")),
         reserve_x: BigInt(String(b.reserve_x ?? "0")),
         reserve_y: BigInt(String(b.reserve_y ?? "0")),
         price: Number(b.price ?? 0),
@@ -898,12 +898,18 @@ function buildWithdrawPayload(
   pool: PoolMeta,
   userBins: UserBin[]
 ): { mcp_tool: string; description: string; params: Record<string, unknown> } {
-  const positions = userBins.map((ub) => ({
-    bin_id: ub.bin_id,
-    amount: ub.liquidity.toString(),
-    min_x_amount: "0",
-    min_y_amount: "0",
-  }));
+  const activeBin = pool.activeBin;
+  const positions = userBins.map((ub) => {
+    // Bins above active are X-only; bins at or below active may have Y.
+    // Core requires min-x-amount + min-y-amount > 0 (err u1002 otherwise).
+    const isXSide = ub.bin_id >= activeBin;
+    return {
+      bin_id: ub.bin_id - CENTER_BIN_ID,  // convert pool uint bin ID → router signed bin ID
+      amount: ub.liquidity.toString(),
+      min_x_amount: isXSide ? "1" : "0",
+      min_y_amount: isXSide ? "0" : "1",
+    };
+  });
   return {
     mcp_tool: "call_contract",
     description: `Withdraw all liquidity from ${pool.poolId}`,
