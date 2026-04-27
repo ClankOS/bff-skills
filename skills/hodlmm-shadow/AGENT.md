@@ -45,23 +45,36 @@ Before any broadcast, the skill evaluates these gates in order and refuses to pr
 
 All write-ops target the on-chain router `SM1FKXGNZJWSTWDWXQZJNF7B5TV5ZB235JTCXYXKD.dlmm-liquidity-router-v-1-2`:
 
-- `follow --execute` → `add-liquidity-multi` (list of `{bin-id, x-amount, y-amount, min-dlp=1, pool-trait, x-token-trait, y-token-trait, max-x-liquidity-fee, max-y-liquidity-fee}`, `deadline-time`)
+- `follow --execute` → `add-liquidity-multi` (list of `{bin-id=API−500, x-amount, y-amount, min-dlp=computed, pool-trait, x-token-trait, y-token-trait, max-x-liquidity-fee, max-y-liquidity-fee}`, `deadline-time`)
 - `sync --execute`   → `add-liquidity-multi` and/or `withdraw-liquidity-multi`
 - `panic --execute`  → `withdraw-liquidity-multi` on every bin the shadow holds
 
 All three require both `--execute` **and** `--i-accept-abi-risk`. Without either, the dry-run plan (including the full Clarity call repr) is emitted instead.
 
-## ABI risk caveat — read before broadcasting
+## ABI notes — resolved
 
-The Bitflow core SDK (`@bitflowlabs/core-sdk`) exposes `prepareSwap` **only** — there is no public HODLMM add/remove helper. This skill therefore constructs Clarity calls directly against the mainnet router, using an ABI reverse-engineered from observed mainnet transactions (`add-liquidity-multi`, `withdraw-liquidity-multi`).
+The Bitflow core SDK (`@bitflowlabs/core-sdk`) exposes `prepareSwap` **only** — there is no public HODLMM add/remove helper. This skill constructs Clarity calls directly against the mainnet router (`add-liquidity-multi`, `withdraw-liquidity-multi`), ABI reverse-engineered from observed mainnet transactions.
 
-Known unknowns:
+**Bin-id offset (resolved).** The Bitflow positions API returns bin IDs offset by +500 from the values stored on-chain. Empirically confirmed:
 
-1. **`bin-id` semantics.** The positions API returns bin IDs in the 500–700 range for `dlmm_1`; an observed on-chain withdraw used `bin-id 8` for a position the API reported as bin 508. A per-pool offset (likely subtracting a pool-constant "zero bin") may apply. The skill currently forwards API bin IDs unchanged — this may be wrong. Verify against a testnet broadcast or contract source before relying on it.
-2. **`min-dlp` / slippage.** Set to `u1` to accept any LP tokens — too loose for normal use, intentional for emergency tolerance. Tighten before production.
-3. **Post-conditions.** Observed txs carry no post-conditions and use `PostConditionMode.Allow`. The skill follows that pattern; safety is enforced by the router's own `min-dlp`, `min-x-amount`, `min-y-amount` guards.
+| Source | Active bin | Example whale bins |
+|--------|-----------|-------------------|
+| Bitflow API | 663 | 552–557, 709–713 |
+| On-chain (`get-pool-for-add`, router tx args) | 163 | 52–57, 209–213 |
+| Offset | **+500** | **+500** |
 
-The `--i-accept-abi-risk` flag exists so the skill will not silently broadcast an ABI-risky call. An operator must explicitly acknowledge these caveats per invocation.
+All router calls use `on-chain bin-id = API bin-id − 500`. This is encoded in the `BIN_ID_OFFSET = 500` constant and applied inside `buildAddLiquidityCall` / `buildWithdrawLiquidityCall`.
+
+**Slippage floors (resolved).** `min-dlp`, `min-x-amount`, and `min-y-amount` are computed from live pool reserves fetched from `/api/quotes/v1/bins/{poolId}` before every broadcast:
+
+- **Add liquidity (X-side):** `expectedDlp = xAmount × totalDlp / reserveX` → `minDlp = max(1, floor(expectedDlp × (1 − slippage%)))`.
+- **Withdraw:** `minX = floor(burnAmt × reserveX / totalDlp × (1 − slippage%))`, same for Y.
+
+The operator-supplied `--max-slippage` value flows end-to-end: CLI gate → state → on-chain min-* args.
+
+**Post-conditions.** Observed mainnet txs carry no explicit post-conditions and use `PostConditionMode.Allow`. The skill follows that pattern. Safety is now enforced at the contract level by the router's own `min-dlp` / `min-x-amount` / `min-y-amount` guards, which are set to non-trivial computed values (not hardcoded `u1` or `u0`).
+
+The `--i-accept-abi-risk` flag remains as an explicit acknowledgement gate before any broadcast.
 
 ## Refusal policy — CRITICAL
 

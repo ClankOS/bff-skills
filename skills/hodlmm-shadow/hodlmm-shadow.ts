@@ -53,6 +53,12 @@ const DEFAULT_DRIFT_PCT     = 10;
 const DRIFT_PCT_FLOOR       = 5;
 const FETCH_TIMEOUT_MS      = 30_000;
 
+// Bitflow API uses bin IDs that are offset by 500 from on-chain bin IDs stored in the
+// dlmm-pool contract. Empirically confirmed: API active bin 663 = on-chain int128(163);
+// a whale's on-chain bins 52,209 appear as API bins 552,709. All router calls
+// (add-liquidity-multi / withdraw-liquidity-multi) must use on-chain IDs (API bin − offset).
+const BIN_ID_OFFSET = 500;
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface ShadowState {
@@ -444,32 +450,66 @@ async function buildAddLiquidityCall(params: {
   poolContract:   string;   // "SP...xx.dlmm-pool-..."
   xTokenContract: string;
   yTokenContract: string;
-  positions:      { binId: number; xAmount: number; yAmount: number }[];
+  positions:      { binId: number; xAmount: number; yAmount: number }[];  // binId = API bin ID
   feeBpsCap:      number;   // e.g. 100 (= 1%)
+  maxSlippagePct: number;   // e.g. 1 (= 1%)
+  binReservesMap: Map<number, HodlmmBin>;   // keyed by API bin ID
 }): Promise<RouterCall> {
   const { tupleCV, listCV, intCV, uintCV, contractPrincipalCV, someCV } = await import("@stacks/transactions" as any);
   const pool = splitContract(params.poolContract);
   const xTok = splitContract(params.xTokenContract);
   const yTok = splitContract(params.yTokenContract);
   const feeOf = (amt: number) => Math.ceil(amt * (params.feeBpsCap / 10_000));
-  const positions = params.positions.map(p => tupleCV({
-    "bin-id":                intCV(p.binId),
-    "max-x-liquidity-fee":   uintCV(feeOf(p.xAmount)),
-    "max-y-liquidity-fee":   uintCV(feeOf(p.yAmount)),
-    "min-dlp":               uintCV(1),
-    "pool-trait":            contractPrincipalCV(pool.address, pool.name),
-    "x-amount":              uintCV(p.xAmount),
-    "x-token-trait":         contractPrincipalCV(xTok.address, xTok.name),
-    "y-amount":              uintCV(p.yAmount),
-    "y-token-trait":         contractPrincipalCV(yTok.address, yTok.name),
-  }));
+  const slip  = params.maxSlippagePct / 100;
+
+  const positions = params.positions.map(p => {
+    const onChainBinId = p.binId - BIN_ID_OFFSET;
+    const res = params.binReservesMap.get(p.binId);
+    const totalDlp = Number(res?.liquidity ?? 0);
+    const xBal     = Number(res?.reserve_x ?? 0);
+    const yBal     = Number(res?.reserve_y ?? 0);
+
+    // Compute expected DLP minted: proportional to contribution vs existing reserves.
+    // Single-sided X deposit (xAmount > 0, yAmount == 0): use X reserve ratio.
+    // Single-sided Y deposit: use Y reserve ratio.
+    // Both > 0 (active bin): take the min to be conservative.
+    let expectedDlp = 0;
+    if (totalDlp > 0) {
+      if (p.xAmount > 0 && xBal > 0) {
+        const dlpFromX = Math.floor(p.xAmount * totalDlp / xBal);
+        expectedDlp = p.yAmount > 0 && yBal > 0
+          ? Math.min(dlpFromX, Math.floor(p.yAmount * totalDlp / yBal))
+          : dlpFromX;
+      } else if (p.yAmount > 0 && yBal > 0) {
+        expectedDlp = Math.floor(p.yAmount * totalDlp / yBal);
+      }
+      // else: empty bin, new first depositor — can't quote; fall through to floor of 1
+    }
+    // Apply slippage: floor to at least 1 (contract rejects 0)
+    const minDlp = Math.max(1, Math.floor(expectedDlp * (1 - slip)));
+
+    return {
+      cv: tupleCV({
+        "bin-id":                intCV(onChainBinId),
+        "max-x-liquidity-fee":   uintCV(feeOf(p.xAmount)),
+        "max-y-liquidity-fee":   uintCV(feeOf(p.yAmount)),
+        "min-dlp":               uintCV(minDlp),
+        "pool-trait":            contractPrincipalCV(pool.address, pool.name),
+        "x-amount":              uintCV(p.xAmount),
+        "x-token-trait":         contractPrincipalCV(xTok.address, xTok.name),
+        "y-amount":              uintCV(p.yAmount),
+        "y-token-trait":         contractPrincipalCV(yTok.address, yTok.name),
+      }),
+      repr: `{bin-id: ${onChainBinId}, x-amount: u${p.xAmount}, y-amount: u${p.yAmount}, min-dlp: u${minDlp}, pool: '${params.poolContract}}`,
+    };
+  });
   const deadline = Math.floor(Date.now() / 1000) + 300;
   return {
     contractAddress: ROUTER_ADDRESS,
     contractName:    ROUTER_NAME,
     functionName:    "add-liquidity-multi",
-    functionArgs:    [listCV(positions), someCV(uintCV(deadline))],
-    humanRepr:       `(contract-call? '${ROUTER_ADDRESS}.${ROUTER_NAME} add-liquidity-multi (list ${params.positions.map(p => `{bin-id: ${p.binId}, x-amount: u${p.xAmount}, y-amount: u${p.yAmount}, min-dlp: u1, pool: '${params.poolContract}}`).join(" ")}) (some u${deadline}))`,
+    functionArgs:    [listCV(positions.map(p => p.cv)), someCV(uintCV(deadline))],
+    humanRepr:       `(contract-call? '${ROUTER_ADDRESS}.${ROUTER_NAME} add-liquidity-multi (list ${positions.map(p => p.repr).join(" ")}) (some u${deadline}))`,
   };
 }
 
@@ -477,28 +517,48 @@ async function buildWithdrawLiquidityCall(params: {
   poolContract:   string;
   xTokenContract: string;
   yTokenContract: string;
-  positions:      { binId: number; liquidity: string | number }[];
+  positions:      { binId: number; liquidity: string | number }[];  // binId = API bin ID
+  maxSlippagePct: number;
+  binReservesMap: Map<number, HodlmmBin>;
 }): Promise<RouterCall> {
   const { tupleCV, listCV, intCV, uintCV, contractPrincipalCV, someCV } = await import("@stacks/transactions" as any);
   const pool = splitContract(params.poolContract);
   const xTok = splitContract(params.xTokenContract);
   const yTok = splitContract(params.yTokenContract);
-  const positions = params.positions.map(p => tupleCV({
-    "amount":        uintCV(String(p.liquidity)),
-    "bin-id":        intCV(p.binId),
-    "min-x-amount":  uintCV(0),
-    "min-y-amount":  uintCV(0),
-    "pool-trait":    contractPrincipalCV(pool.address, pool.name),
-    "x-token-trait": contractPrincipalCV(xTok.address, xTok.name),
-    "y-token-trait": contractPrincipalCV(yTok.address, yTok.name),
-  }));
+  const slip  = params.maxSlippagePct / 100;
+
+  const positions = params.positions.map(p => {
+    const onChainBinId = p.binId - BIN_ID_OFFSET;
+    const burnAmt  = Number(p.liquidity);
+    const res      = params.binReservesMap.get(p.binId);
+    const totalDlp = Number(res?.liquidity ?? 0);
+    const xBal     = Number(res?.reserve_x ?? 0);
+    const yBal     = Number(res?.reserve_y ?? 0);
+
+    // Pro-rata share of reserves for the DLP being burned, minus slippage tolerance.
+    const minX = totalDlp > 0 ? Math.floor(burnAmt * xBal / totalDlp * (1 - slip)) : 0;
+    const minY = totalDlp > 0 ? Math.floor(burnAmt * yBal / totalDlp * (1 - slip)) : 0;
+
+    return {
+      cv: tupleCV({
+        "amount":        uintCV(String(burnAmt)),
+        "bin-id":        intCV(onChainBinId),
+        "min-x-amount":  uintCV(minX),
+        "min-y-amount":  uintCV(minY),
+        "pool-trait":    contractPrincipalCV(pool.address, pool.name),
+        "x-token-trait": contractPrincipalCV(xTok.address, xTok.name),
+        "y-token-trait": contractPrincipalCV(yTok.address, yTok.name),
+      }),
+      repr: `{bin-id: ${onChainBinId}, amount: u${burnAmt}, min-x-amount: u${minX}, min-y-amount: u${minY}, pool: '${params.poolContract}}`,
+    };
+  });
   const deadline = Math.floor(Date.now() / 1000) + 300;
   return {
     contractAddress: ROUTER_ADDRESS,
     contractName:    ROUTER_NAME,
     functionName:    "withdraw-liquidity-multi",
-    functionArgs:    [listCV(positions), someCV(uintCV(deadline))],
-    humanRepr:       `(contract-call? '${ROUTER_ADDRESS}.${ROUTER_NAME} withdraw-liquidity-multi (list ${params.positions.map(p => `{bin-id: ${p.binId}, amount: u${p.liquidity}, min-x-amount: u0, min-y-amount: u0, pool: '${params.poolContract}}`).join(" ")}) (some u${deadline}))`,
+    functionArgs:    [listCV(positions.map(p => p.cv)), someCV(uintCV(deadline))],
+    humanRepr:       `(contract-call? '${ROUTER_ADDRESS}.${ROUTER_NAME} withdraw-liquidity-multi (list ${positions.map(p => p.repr).join(" ")}) (some u${deadline}))`,
   };
 }
 
@@ -654,17 +714,23 @@ program
       const yTokenContract = appPool?.tokens?.tokenY?.contract ?? pool.token_y;
       if (!poolContract) return fail("follow", "App pool missing poolContract — cannot build router call.");
 
+      // Fetch pool-wide bin reserves for slippage-floor computation.
+      const allBins       = await getBins(opts.poolId);
+      const binReservesMap = new Map(allBins.map(b => [b.bin_id, b]));
+
       const call = await buildAddLiquidityCall({
         poolContract, xTokenContract, yTokenContract,
         positions: plan.map(d => ({ binId: d.binId, xAmount: d.amountBase, yAmount: 0 })),
-        feeBpsCap: 100, // 1% max fee tolerated per observed mainnet txs
+        feeBpsCap:      100,              // 1% max fee per observed mainnet txs
+        maxSlippagePct: opts.maxSlippage,
+        binReservesMap,
       });
 
       let ownerAddress = "";
       if (opts.execute) {
         if (!opts.iAcceptAbiRisk)
           return blocked("follow", { failed_gate: "abi_risk_ack" },
-            "--execute requires --i-accept-abi-risk. Router bin-id semantics vs. API bin-id are unverified; see AGENT.md.");
+            "--execute requires --i-accept-abi-risk. Bin-id offset (API − 500 = on-chain) resolved empirically; see AGENT.md.");
         if (!opts.password) return fail("follow", "--execute requires --password");
         const keys = await loadWalletKeys(opts.password);
         ownerAddress = keys.stxAddress;
@@ -750,7 +816,14 @@ program
       // bin_cap is enforced inside computeDeployPlan (top-N truncation).
 
       const shape = extractShape(targetBins);
-      const targetPlan = computeDeployPlan(shape, state.budget, state.maxBins);
+      let targetPlan = computeDeployPlan(shape, state.budget, state.maxBins);
+      // Apply the same single-sided filter as follow: shadow was built with one token side,
+      // so only sync bins on that same side relative to the current active bin.
+      const currentPool = await getPool(state.poolId);
+      if (currentPool) {
+        const syncSide: "x" | "y" = state.budgetToken === "sbtc" ? "x" : "x";
+        targetPlan = filterSingleSidedPlan(targetPlan, currentPool.active_bin, syncSide);
+      }
       const diff = diffShapes(state.shadowBins, targetPlan);
 
       if (diff.driftPct < state.driftPct)
@@ -780,11 +853,16 @@ program
       if (!poolContract || !xTokenContract || !yTokenContract)
         return fail("sync", "App pool metadata incomplete — cannot build router calls.");
 
+      const allBins       = await getBins(state.poolId);
+      const binReservesMap = new Map(allBins.map(b => [b.bin_id, b]));
+
       const txs: any[] = [];
       if (diff.removes.length > 0) {
         const wcall = await buildWithdrawLiquidityCall({
           poolContract, xTokenContract, yTokenContract,
           positions: diff.removes.map(r => ({ binId: r.binId, liquidity: r.liquidity })),
+          maxSlippagePct: state.maxSlippagePct,
+          binReservesMap,
         });
         const res = await broadcastSignedCall({ ...wcall, postConditions: [], stxPrivateKey: keys.stxPrivateKey });
         txs.push({ op: "withdraw", bins: diff.removes.length, ...res });
@@ -794,7 +872,9 @@ program
         const acall = await buildAddLiquidityCall({
           poolContract, xTokenContract, yTokenContract,
           positions: diff.adds.map(a => ({ binId: a.binId, xAmount: a.amountBase, yAmount: 0 })),
-          feeBpsCap: 100,
+          feeBpsCap:      100,
+          maxSlippagePct: state.maxSlippagePct,
+          binReservesMap,
         });
         const res = await broadcastSignedCall({ ...acall, postConditions: [], stxPrivateKey: keys.stxPrivateKey });
         txs.push({ op: "add", bins: diff.adds.length, ...res });
@@ -839,9 +919,14 @@ program
       if (!poolContract || !xTokenContract || !yTokenContract)
         return fail("panic", "App pool metadata incomplete — cannot build router call.");
 
+      const allBins       = await getBins(state.poolId);
+      const binReservesMap = new Map(allBins.map(b => [b.bin_id, b]));
+
       const wcall = await buildWithdrawLiquidityCall({
         poolContract, xTokenContract, yTokenContract,
         positions: state.shadowBins.map(b => ({ binId: b.binId, liquidity: b.liquidity })),
+        maxSlippagePct: state.maxSlippagePct,
+        binReservesMap,
       });
 
       if (!opts.execute) {
